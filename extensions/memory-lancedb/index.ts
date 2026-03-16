@@ -2,14 +2,13 @@
  * OpenClaw Memory (LanceDB) Plugin
  *
  * Long-term memory with vector search for AI conversations.
- * Uses LanceDB for storage and OpenAI for embeddings.
+ * Uses LanceDB for storage and OpenAI or Ollama for embeddings.
  * Provides seamless auto-recall and auto-capture via lifecycle hooks.
  */
 
 import { randomUUID } from "node:crypto";
 import type * as LanceDB from "@lancedb/lancedb";
 import { Type } from "@sinclair/typebox";
-import OpenAI from "openai";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import {
   DEFAULT_CAPTURE_MAX_CHARS,
@@ -157,26 +156,72 @@ class MemoryDB {
 }
 
 // ============================================================================
-// OpenAI Embeddings
+// Embeddings (OpenAI or Ollama)
 // ============================================================================
 
-class Embeddings {
-  private client: OpenAI;
+interface EmbeddingProvider {
+  embed(text: string): Promise<number[]>;
+}
+
+class OpenAIEmbeddings implements EmbeddingProvider {
+  private clientPromise: Promise<InstanceType<typeof import("openai").default>>;
 
   constructor(
     apiKey: string,
     private model: string,
   ) {
-    this.client = new OpenAI({ apiKey });
+    // Lazy import: avoids hard dependency on 'openai' package when using Ollama
+    this.clientPromise = import("openai").then(({ default: OpenAI }) => new OpenAI({ apiKey }));
   }
 
   async embed(text: string): Promise<number[]> {
-    const response = await this.client.embeddings.create({
+    const client = await this.clientPromise;
+    const response = await client.embeddings.create({
       model: this.model,
       input: text,
     });
     return response.data[0].embedding;
   }
+}
+
+class OllamaEmbeddings implements EmbeddingProvider {
+  constructor(
+    private baseUrl: string,
+    private model: string,
+  ) {}
+
+  async embed(text: string): Promise<number[]> {
+    const url = `${this.baseUrl.replace(/\/+$/, "")}/api/embed`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: this.model, input: text }),
+    });
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "unknown error");
+      throw new Error(`Ollama embeddings error ${response.status}: ${errorText}`);
+    }
+    const data = (await response.json()) as { embeddings: number[][] };
+    if (!data.embeddings?.[0]) {
+      throw new Error("Ollama returned empty embeddings");
+    }
+    return data.embeddings[0];
+  }
+}
+
+function createEmbeddingProvider(cfg: {
+  provider: "openai" | "ollama";
+  apiKey?: string;
+  model: string;
+  baseUrl?: string;
+}): EmbeddingProvider {
+  if (cfg.provider === "ollama") {
+    return new OllamaEmbeddings(cfg.baseUrl ?? "http://127.0.0.1:11434", cfg.model);
+  }
+  if (!cfg.apiKey) {
+    throw new Error("apiKey is required for OpenAI embeddings");
+  }
+  return new OpenAIEmbeddings(cfg.apiKey, cfg.model);
 }
 
 // ============================================================================
@@ -293,9 +338,14 @@ const memoryPlugin = {
   register(api: OpenClawPluginApi) {
     const cfg = memoryConfigSchema.parse(api.pluginConfig);
     const resolvedDbPath = api.resolvePath(cfg.dbPath!);
-    const vectorDim = vectorDimsForModel(cfg.embedding.model ?? "text-embedding-3-small");
+    const vectorDim = vectorDimsForModel(cfg.embedding.model ?? "nomic-embed-text");
     const db = new MemoryDB(resolvedDbPath, vectorDim);
-    const embeddings = new Embeddings(cfg.embedding.apiKey, cfg.embedding.model!);
+    const embeddings = createEmbeddingProvider({
+      provider: cfg.embedding.provider,
+      apiKey: cfg.embedding.apiKey,
+      model: cfg.embedding.model!,
+      baseUrl: cfg.embedding.baseUrl,
+    });
 
     api.logger.info(`memory-lancedb: plugin registered (db: ${resolvedDbPath}, lazy init)`);
 

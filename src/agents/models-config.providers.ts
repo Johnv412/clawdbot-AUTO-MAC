@@ -910,15 +910,23 @@ export async function resolveImplicitProviders(params: {
     break;
   }
 
-  // Ollama provider - only add if explicitly configured.
+  // Ollama provider - register when explicitly configured OR when no API key
+  // is needed (local Ollama requires no auth). This enables local-first operation
+  // without requiring OLLAMA_API_KEY to be set.
   // Use the user's configured baseUrl (from explicit providers) for model
   // discovery so that remote / non-default Ollama instances are reachable.
-  const ollamaKey =
-    resolveEnvApiKeyVarName("ollama") ??
-    resolveApiKeyFromProfiles({ provider: "ollama", store: authStore });
-  if (ollamaKey) {
+  if (!providers.ollama) {
+    const ollamaKey =
+      resolveEnvApiKeyVarName("ollama") ??
+      resolveApiKeyFromProfiles({ provider: "ollama", store: authStore });
     const ollamaBaseUrl = params.explicitProviders?.ollama?.baseUrl;
-    providers.ollama = { ...(await buildOllamaProvider(ollamaBaseUrl)), apiKey: ollamaKey };
+    // Always attempt Ollama discovery: local instances need no key.
+    // Use a sentinel value "ollama-local" when no real key is found so the
+    // provider is registered and models are discoverable.
+    const ollamaProvider = await buildOllamaProvider(ollamaBaseUrl);
+    if (ollamaKey || ollamaProvider.models.length > 0) {
+      providers.ollama = { ...ollamaProvider, apiKey: ollamaKey ?? "ollama-local" };
+    }
   }
 
   // vLLM provider - OpenAI-compatible local server (opt-in via env/profile).
